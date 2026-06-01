@@ -1,0 +1,6 @@
+comment = 'Document inspection utilities for BSON and JSONB storage formats'
+default_version = '0.1-0'
+module_pathname = '$libdir/pg_docinspect'
+relocatable = false
+superuser = true
+requires = 'documentdb_core'
