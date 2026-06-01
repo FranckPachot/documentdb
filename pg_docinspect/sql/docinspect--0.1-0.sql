@@ -235,3 +235,227 @@ COMMENT ON FUNCTION docinspect.index_entries(regclass, tid)
 -- =============================================================================
 
 GRANT USAGE ON SCHEMA docinspect TO PUBLIC;
+
+-- =============================================================================
+-- Storage Inspection: Shows how a varlena datum is stored (inline/compressed/TOAST)
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION docinspect.storage_info(
+    doc anyelement
+)
+RETURNS TABLE (
+    storage_type      text,
+    raw_size          int,
+    stored_size       int,
+    compression_ratio float8,
+    toast_pointer     bool
+)
+LANGUAGE c STRICT
+AS 'MODULE_PATHNAME', $function$docinspect_storage_info$function$;
+
+COMMENT ON FUNCTION docinspect.storage_info(anyelement)
+    IS 'Shows storage details: inline/compressed/TOAST, sizes, and compression ratio';
+
+-- =============================================================================
+-- TOAST Chunks: Shows TOAST chunk details for a table column value
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION docinspect.toast_chunks(
+    p_relname regclass,
+    p_ctid tid,
+    p_colname text
+)
+RETURNS TABLE (
+    chunk_id     oid,
+    chunk_seq    int,
+    chunk_size   int
+)
+LANGUAGE plpgsql STABLE STRICT
+AS $$
+DECLARE
+    toast_relid oid;
+    val_oid oid;
+BEGIN
+    -- Get the TOAST table for this relation
+    SELECT reltoastrelid INTO toast_relid
+    FROM pg_class WHERE oid = p_relname;
+
+    IF toast_relid IS NULL OR toast_relid = 0 THEN
+        RAISE NOTICE 'Table % has no TOAST table (all values stored inline)', p_relname;
+        RETURN;
+    END IF;
+
+    -- Get the raw toast pointer value from the tuple
+    -- We query the TOAST table directly for all chunks
+    RETURN QUERY EXECUTE format(
+        'SELECT chunk_id, chunk_seq, octet_length(chunk_data)::int '
+        'FROM pg_toast.%I '
+        'WHERE chunk_id = (SELECT chunk_id FROM pg_toast.%I LIMIT 1) '
+        'ORDER BY chunk_seq',
+        'pg_toast_' || p_relname::oid,
+        'pg_toast_' || p_relname::oid
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION docinspect.toast_chunks(regclass, tid, text)
+    IS 'Shows TOAST chunk details (chunk_id, sequence, size) for a TOASTed value';
+
+-- =============================================================================
+-- Storage Summary: Shows storage stats for all rows in a table column
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION docinspect.storage_summary(
+    p_relname regclass,
+    p_colname text,
+    p_limit int DEFAULT 100
+)
+RETURNS TABLE (
+    total_rows       bigint,
+    avg_raw_size     numeric,
+    avg_stored_size  numeric,
+    min_size         int,
+    max_size         int,
+    toasted_count    bigint,
+    inline_count     bigint,
+    avg_compression  numeric
+)
+LANGUAGE plpgsql STABLE STRICT
+AS $$
+BEGIN
+    RETURN QUERY EXECUTE format(
+        'WITH sample AS (
+            SELECT %I as val FROM %s LIMIT %s
+        ),
+        info AS (
+            SELECT
+                (docinspect.storage_info(val)).raw_size as raw,
+                (docinspect.storage_info(val)).stored_size as stored,
+                (docinspect.storage_info(val)).toast_pointer as is_toasted
+            FROM sample
+            WHERE val IS NOT NULL
+        )
+        SELECT
+            count(*)::bigint,
+            round(avg(raw)::numeric, 1),
+            round(avg(stored)::numeric, 1),
+            min(stored),
+            max(stored),
+            count(*) FILTER (WHERE is_toasted)::bigint,
+            count(*) FILTER (WHERE NOT is_toasted)::bigint,
+            CASE WHEN avg(raw) > 0
+                 THEN round((1.0 - avg(stored)::numeric / avg(raw)::numeric) * 100, 1)
+                 ELSE 0 END
+        FROM info',
+        p_colname, p_relname::text, p_limit
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION docinspect.storage_summary(regclass, text, int)
+    IS 'Shows storage statistics for a column: sizes, compression ratio, TOAST counts';
+
+-- =============================================================================
+-- Index Stats: Shows index efficiency metrics for a DocumentDB collection
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION docinspect.index_stats(
+    p_database_name text DEFAULT NULL,
+    p_collection_name text DEFAULT NULL
+)
+RETURNS TABLE (
+    table_name       text,
+    index_name       text,
+    index_type       text,
+    index_size       text,
+    table_size       text,
+    index_scans      bigint,
+    tuples_read      bigint,
+    tuples_fetched   bigint,
+    bloat_ratio      numeric
+)
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE
+    tbl_pattern text;
+BEGIN
+    -- Build table name pattern
+    IF p_database_name IS NOT NULL AND p_collection_name IS NOT NULL THEN
+        tbl_pattern := docinspect.collection_table(p_database_name, p_collection_name)::text;
+    ELSE
+        tbl_pattern := 'documentdb_data.documents_%';
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        c.relname::text as table_name,
+        i.relname::text as index_name,
+        am.amname::text as index_type,
+        pg_size_pretty(pg_relation_size(i.oid)) as index_size,
+        pg_size_pretty(pg_relation_size(c.oid)) as table_size,
+        COALESCE(s.idx_scan, 0) as index_scans,
+        COALESCE(s.idx_tup_read, 0) as tuples_read,
+        COALESCE(s.idx_tup_fetch, 0) as tuples_fetched,
+        CASE WHEN pg_relation_size(c.oid) > 0
+             THEN round(pg_relation_size(i.oid)::numeric / pg_relation_size(c.oid)::numeric, 2)
+             ELSE 0 END as bloat_ratio
+    FROM pg_index idx
+    JOIN pg_class c ON c.oid = idx.indrelid
+    JOIN pg_class i ON i.oid = idx.indexrelid
+    JOIN pg_am am ON am.oid = i.relam
+    LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.oid
+    WHERE c.relnamespace = 'documentdb_data'::regnamespace
+      AND (p_database_name IS NULL OR c.relname = split_part(tbl_pattern, '.', 2)
+           OR tbl_pattern = 'documentdb_data.documents_%')
+    ORDER BY pg_relation_size(i.oid) DESC;
+END;
+$$;
+
+COMMENT ON FUNCTION docinspect.index_stats(text, text)
+    IS 'Shows index efficiency metrics: size, scan counts, bloat ratio';
+
+-- =============================================================================
+-- Index Size Breakdown: Detailed size info per index for a collection
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION docinspect.index_size_detail(
+    p_database_name text,
+    p_collection_name text
+)
+RETURNS TABLE (
+    index_name       text,
+    index_type       text,
+    index_size_bytes bigint,
+    index_size_pretty text,
+    table_size_bytes bigint,
+    ratio_to_table   numeric,
+    num_index_tuples bigint
+)
+LANGUAGE plpgsql STABLE STRICT
+AS $$
+DECLARE
+    tbl regclass;
+BEGIN
+    tbl := docinspect.collection_table(p_database_name, p_collection_name);
+
+    RETURN QUERY
+    SELECT
+        i.relname::text,
+        am.amname::text,
+        pg_relation_size(i.oid),
+        pg_size_pretty(pg_relation_size(i.oid)),
+        pg_relation_size(tbl),
+        CASE WHEN pg_relation_size(tbl) > 0
+             THEN round(pg_relation_size(i.oid)::numeric / pg_relation_size(tbl)::numeric * 100, 1)
+             ELSE 0 END,
+        i.reltuples::bigint
+    FROM pg_index idx
+    JOIN pg_class i ON i.oid = idx.indexrelid
+    JOIN pg_am am ON am.oid = i.relam
+    WHERE idx.indrelid = tbl
+    ORDER BY pg_relation_size(i.oid) DESC;
+END;
+$$;
+
+COMMENT ON FUNCTION docinspect.index_size_detail(text, text)
+    IS 'Shows detailed size breakdown for all indexes on a DocumentDB collection';

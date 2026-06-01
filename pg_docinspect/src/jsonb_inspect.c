@@ -50,17 +50,17 @@ ensure_jsonb_capacity(JsonbInspectState *state)
 	if (state->num_entries >= state->max_entries)
 	{
 		state->max_entries *= 2;
-		state->entries = repalloc(state->entries,
+		state->entries = (JsonbInspectEntry *) repalloc(state->entries,
 								 sizeof(JsonbInspectEntry) * state->max_entries);
 	}
 }
 
 
 /*
- * Format a JsonbValue as a human-readable string.
+ * Format a scalar JsonbValue as a human-readable string.
  */
 static char *
-format_jsonb_value(JsonbValue *val)
+format_jsonb_scalar(JsonbValue *val)
 {
 	switch (val->type)
 	{
@@ -79,24 +79,11 @@ format_jsonb_value(JsonbValue *val)
 
 		case jbvString:
 		{
-			if (val->val.string.len > 64)
-				return psprintf("\"%.*s\"... (%d bytes)",
-								64, val->val.string.val, val->val.string.len);
+			int len = val->val.string.len;
+			if (len > 64)
+				return psprintf("\"%.*s\"... (%d bytes)", 64, val->val.string.val, len);
 			else
-				return psprintf("\"%.*s\"",
-								val->val.string.len, val->val.string.val);
-		}
-
-		case jbvBinary:
-		{
-			JsonbContainer *jc = val->val.binary.data;
-			uint32 header = *(uint32 *) jc;
-			uint32 count = header & JB_CMASK;
-			bool is_obj = (header & JB_FOBJECT) != 0;
-			return psprintf("%s (count=%u, %d bytes)",
-							is_obj ? "{...}" : "[...]",
-							count,
-							(int) val->val.binary.len);
+				return psprintf("\"%.*s\"", len, val->val.string.val);
 		}
 
 		default:
@@ -106,10 +93,10 @@ format_jsonb_value(JsonbValue *val)
 
 
 /*
- * Get the byte size of a JsonbValue's data portion.
+ * Get the approximate byte size of a scalar JsonbValue's data portion.
  */
 static int
-jsonb_value_size(JsonbValue *val)
+jsonb_scalar_size(JsonbValue *val)
 {
 	switch (val->type)
 	{
@@ -118,11 +105,9 @@ jsonb_value_size(JsonbValue *val)
 		case jbvBool:
 			return 0;  /* encoded in JEntry flags only */
 		case jbvNumeric:
-			return VARSIZE_ANY(val->val.numeric);
+			return (int) VARSIZE_ANY(val->val.numeric);
 		case jbvString:
 			return val->val.string.len;
-		case jbvBinary:
-			return (int) val->val.binary.len;
 		default:
 			return 0;
 	}
@@ -131,6 +116,7 @@ jsonb_value_size(JsonbValue *val)
 
 /*
  * Walk the JSONB using JsonbIterator and collect entries.
+ * This is safe — we only access val fields appropriate for each token type.
  */
 static void
 collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
@@ -141,14 +127,14 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 	int depth = 0;
 	int offset = 0;
 	char *pending_key = NULL;
-	int array_index[32];  /* track array indices per depth */
-	bool in_array[32];    /* track whether current depth is array */
+	int array_index[32];
+	bool in_array[32];
 
 	memset(array_index, 0, sizeof(array_index));
 	memset(in_array, 0, sizeof(in_array));
 
 	/* Total size after varlena header */
-	int total_size = VARSIZE(jb) - VARHDRSZ;
+	int total_size = (int) VARSIZE(jb) - VARHDRSZ;
 
 	/* Add overall header entry */
 	ensure_jsonb_capacity(state);
@@ -188,16 +174,15 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 					e->key_or_index = pstrdup("");
 				}
 
-				uint32 header = *(uint32 *) val.val.binary.data;
-				uint32 count = header & JB_CMASK;
-				int container_size = (int) val.val.binary.len;
+				/*
+				 * For WJB_BEGIN_OBJECT, val.type is jbvObject but we cannot
+				 * safely access val.val.binary. Just note the container header.
+				 */
+				e->byte_length = 4;  /* container header is 4 bytes */
+				e->value_repr = psprintf("container header (4 bytes)");
 
-				e->byte_length = 4;  /* container header */
-				e->value_repr = psprintf("header=0x%08x, %u keys, %d bytes",
-										 header, count, container_size);
-
-				/* 4 bytes header + count*2 JEntries (keys+values) */
-				offset += 4 + (count * 2 * 4);
+				/* Advance offset past the header; JEntry sizes are unknown here */
+				offset += 4;
 
 				if (depth < 32)
 				{
@@ -230,16 +215,10 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 					e->key_or_index = pstrdup("");
 				}
 
-				uint32 header = *(uint32 *) val.val.binary.data;
-				uint32 count = header & JB_CMASK;
-				int container_size = (int) val.val.binary.len;
+				e->byte_length = 4;
+				e->value_repr = psprintf("container header (4 bytes)");
 
-				e->byte_length = 4;  /* container header */
-				e->value_repr = psprintf("header=0x%08x, %u elements, %d bytes",
-										 header, count, container_size);
-
-				/* 4 bytes header + count JEntries */
-				offset += 4 + (count * 4);
+				offset += 4;
 
 				if (depth < 32)
 				{
@@ -267,7 +246,7 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 
 			case WJB_KEY:
 			{
-				/* Key: store it and associate with the next value */
+				/* Key: val.type == jbvString, safe to access val.val.string */
 				int key_len = val.val.string.len;
 
 				ensure_jsonb_capacity(state);
@@ -287,14 +266,14 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 			case WJB_VALUE:
 			case WJB_ELEM:
 			{
-				int val_size = jsonb_value_size(&val);
+				int val_size = jsonb_scalar_size(&val);
 
 				ensure_jsonb_capacity(state);
 				JsonbInspectEntry *e = &state->entries[state->num_entries++];
 				e->depth = depth;
 				e->byte_offset = offset;
 				e->byte_length = val_size;
-				e->value_repr = format_jsonb_value(&val);
+				e->value_repr = format_jsonb_scalar(&val);
 
 				/* Determine type name */
 				switch (val.type)
@@ -311,6 +290,13 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 					case jbvString:
 						e->type_name = pstrdup("String");
 						break;
+					case jbvBinary:
+						/* Nested container as a value — will be iterated into */
+						e->type_name = pstrdup("Container");
+						val_size = 0; /* offset handled by WJB_BEGIN_* */
+						e->byte_length = 0;
+						e->value_repr = pstrdup("{...} or [...]");
+						break;
 					default:
 						e->type_name = psprintf("Type(%d)", val.type);
 						break;
@@ -322,7 +308,7 @@ collect_jsonb_entries(Jsonb *jb, JsonbInspectState *state)
 					e->key_or_index = pending_key;
 					pending_key = NULL;
 				}
-				else if (tok == WJB_ELEM && depth > 0 && in_array[depth - 1])
+				else if (tok == WJB_ELEM && depth > 0 && depth <= 32 && in_array[depth - 1])
 				{
 					e->key_or_index = psprintf("[%d]", array_index[depth - 1]++);
 				}
@@ -428,7 +414,7 @@ docinspect_jsonb_inspect_pretty(PG_FUNCTION_ARGS)
 	StringInfoData result;
 	initStringInfo(&result);
 
-	int total_size = VARSIZE(jb) - VARHDRSZ;
+	int total_size = (int) VARSIZE(jb) - VARHDRSZ;
 	appendStringInfo(&result, "JSONB Value (%d bytes after varlena header)\n", total_size);
 	appendStringInfoString(&result, "========================================\n");
 

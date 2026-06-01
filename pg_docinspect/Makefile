@@ -35,3 +35,11 @@ include $(PGXS)
 
 # Override after PGXS include to suppress the warning from libbson headers
 override CFLAGS += -Wno-declaration-after-statement
+
+# Regression tests
+.PHONY: installcheck check-regress
+
+installcheck:
+	$(MAKE) -C src/test/regress installcheck
+
+check-regress: installcheck

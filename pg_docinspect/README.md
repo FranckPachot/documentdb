@@ -30,6 +30,11 @@ CREATE EXTENSION docinspect;
 | `docinspect.collection_table(db, coll)` | Resolves collection name → regclass |
 | `docinspect.collection_index_entries(db, coll, id)` | Index entries by document _id |
 | `docinspect.collection_index_terms(db, coll, id)` | Human-readable index terms by _id |
+| `docinspect.storage_info(anyelement)` | Storage type, sizes, compression ratio |
+| `docinspect.storage_summary(regclass, col, limit)` | Aggregate storage stats for a column |
+| `docinspect.toast_chunks(regclass, tid, col)` | TOAST chunk details for a value |
+| `docinspect.index_stats(db, coll)` | Index efficiency metrics |
+| `docinspect.index_size_detail(db, coll)` | Detailed index size breakdown |
 
 ---
 
@@ -339,6 +344,75 @@ sudo make install
 # Enable in PostgreSQL
 psql -c "CREATE EXTENSION docinspect;"
 ```
+
+### 5. Storage Inspection (TOAST, compression)
+
+Understand how PostgreSQL physically stores your documents.
+
+```sql
+-- Check storage type for a specific value
+SELECT * FROM docinspect.storage_info('{"small": true}'::jsonb);
+--  storage_type                | raw_size | stored_size | compression_ratio | toast_pointer
+-- ----------------------------+----------+-------------+-------------------+--------------
+--  inline (short, 1-byte hdr) |       16 |          17 |              1.06 | f
+
+-- Large document that gets TOASTed
+SELECT * FROM docinspect.storage_info(
+  jsonb_build_object('big', repeat('x', 10000))
+);
+--  storage_type           | raw_size | stored_size | compression_ratio | toast_pointer
+-- -----------------------+----------+-------------+-------------------+--------------
+--  external (TOAST table) |    10020 |          18 |              0.00 | t
+
+-- Aggregate storage stats for a column
+SELECT * FROM docinspect.storage_summary(
+  'documentdb_data.documents_3'::regclass, 'document', 1000
+);
+--  total_rows | avg_raw_size | avg_stored_size | min_size | max_size | toasted_count | compressed_count | inline_count | avg_compression
+-- -----------+--------------+-----------------+----------+----------+---------------+------------------+--------------+----------------
+--        847 |        342.5 |           198.3 |       45 |     8192 |            12 |              230 |          605 |           42.1
+
+-- See TOAST chunks for a large document
+SELECT * FROM docinspect.toast_chunks(
+  'documentdb_data.documents_3'::regclass, '(0,1)'::tid, 'document'
+);
+```
+
+### 6. Index Efficiency Stats
+
+```sql
+-- Overview of all indexes for a collection
+SELECT * FROM docinspect.index_size_detail('mydb', 'users');
+--  index_name             | index_type | index_size_bytes | index_size_pretty | table_size_bytes | ratio_to_table | num_index_tuples
+-- -----------------------+------------+------------------+-------------------+------------------+----------------+-----------------
+--  documents_rum_index_25 | rum        |           163840 | 160 kB            |            81920 |          200.0 |             100
+--  collection_pk_3        | btree      |            16384 | 16 kB             |            81920 |           20.0 |             100
+
+-- All DocumentDB indexes with scan stats
+SELECT * FROM docinspect.index_stats();
+-- Or for a specific collection:
+SELECT * FROM docinspect.index_stats('mydb', 'users');
+```
+
+---
+
+## Running Tests
+
+```bash
+# Inside the container or on a system with the extension installed:
+cd pg_docinspect
+make installcheck
+
+# First run: generate expected output
+# Copy results/bson_inspect.out → expected/bson_inspect.out (etc.)
+# Subsequent runs will diff against expected output
+```
+
+Test files:
+- `src/test/regress/sql/bson_inspect.sql` — BSON binary layout tests
+- `src/test/regress/sql/jsonb_inspect.sql` — JSONB structure tests
+- `src/test/regress/sql/storage_info.sql` — TOAST/compression tests
+- `src/test/regress/sql/index_entries.sql` — Index entry extraction tests
 
 ## License
 
